@@ -19,5 +19,5 @@ packages = ["src/mcp_edocs_provider"]
 [tool.uv.sources]
 aauth-edocs = { path = "../aauth", editable = true }
 mcp-aauth = { path = "../mcp-aauth", editable = true }
-mcp = { path = "../mcp-python-sdk", editable = true }
-mcp-types = { path = "../mcp-python-sdk/src/mcp-types", editable = true }
+mcp = { path = "../python-sdk", editable = true }
+mcp-types = { path = "../python-sdk/src/mcp-types", editable = true }

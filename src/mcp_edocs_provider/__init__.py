@@ -39,6 +39,7 @@ class CatalogEntry:
     description: str
     enabled: bool
     storage: Any
+    controllers: tuple[str, ...] | None = None
 
     def public_dict(self, *, include_enabled: bool = False) -> dict[str, Any]:
         value = {
@@ -49,6 +50,8 @@ class CatalogEntry:
         }
         if include_enabled:
             value["enabled"] = self.enabled
+        if self.controllers is not None:
+            value["controllers"] = list(self.controllers)
         return value
 
 
@@ -192,7 +195,7 @@ class ProviderResource:
     functions: MutableFunctionRegistry
     loader: LocalFunctionLoader
     on_materialized: Callable[
-        [Dataflow, dict[str, Any], tuple[str, ...]], None
+        [Dataflow, dict[str, Any], tuple[str, ...]], Any
     ] | None = None
 
     def authorize(
@@ -219,7 +222,7 @@ class ProviderResource:
             scope=function_id,
             source_agent=self.config.source_agent,
             edoc_id=edoc_id,
-            controllers=self.config.authoritative_controllers,
+            controllers=self._controllers_for(edoc_id),
             function_args=function_args,
             key=self.config.signing_key,
         )
@@ -241,13 +244,14 @@ class ProviderResource:
                 401,
                 "authorization agent is incomplete",
             )
+        controllers = self._controllers_for(edoc_id)
         expected = {
             "iss": self.config.sentinel_url,
             "aud": self.config.resource_issuer,
             "source_agent": self.config.source_agent,
             "scope": function_id,
             "edoc_id": edoc_id,
-            "controllers": list(self.config.authoritative_controllers),
+            "controllers": list(controllers),
             "function_args_hash": hash_function_args(function_args),
         }
         for name, value in expected.items():
@@ -264,7 +268,7 @@ class ProviderResource:
         implementation = self.loader.load(registration.descriptor)
         result = implementation(document.storage, function_args)
         if self.on_materialized is not None:
-            self.on_materialized(
+            derived = self.on_materialized(
                 Dataflow.from_arguments(
                     self.config.source_agent,
                     function_id,
@@ -273,9 +277,18 @@ class ProviderResource:
                     function_args,
                 ),
                 result,
-                self.config.authoritative_controllers,
+                controllers,
             )
+            edoc_id_value = getattr(derived, "edoc_id", None)
+            if isinstance(edoc_id_value, str) and edoc_id_value:
+                result = {**result, "derived_edoc_id": edoc_id_value}
         return result
+
+    def _controllers_for(self, edoc_id: str) -> tuple[str, ...]:
+        entry = self.catalog.get(edoc_id, include_disabled=True)
+        if entry is not None and entry.controllers is not None:
+            return entry.controllers
+        return self.config.authoritative_controllers
 
     def _check_provider(self, provider_id: str) -> None:
         if provider_id != self.config.provider_id:
@@ -435,6 +448,7 @@ class _ProviderApplication:
     ) -> None:
         path = scope["path"].removeprefix("/admin/documents").strip("/")
         method = scope.get("method")
+        status = 200
         try:
             if not path and method == "GET":
                 value = {
@@ -445,6 +459,47 @@ class _ProviderApplication:
                         )
                     ]
                 }
+            elif not path and method == "POST":
+                body = await _read_json(receive)
+                required = {
+                    "edoc_id",
+                    "title",
+                    "description",
+                    "storage",
+                    "controllers",
+                }
+                if set(body) != required:
+                    raise ValueError(
+                        "document requires edoc_id, title, description, "
+                        "storage, and controllers"
+                    )
+                controllers = body["controllers"]
+                if (
+                    not isinstance(controllers, list)
+                    or not controllers
+                    or any(not isinstance(item, str) or not item for item in controllers)
+                ):
+                    raise ValueError("controllers must be a non-empty string list")
+                if not isinstance(body["storage"], dict):
+                    raise ValueError("storage must be a JSON object")
+                edoc_id = body["edoc_id"]
+                if not isinstance(edoc_id, str) or not edoc_id:
+                    raise ValueError("edoc_id must be a non-empty string")
+                entry = self.resource.catalog.add(
+                    CatalogEntry(
+                        edoc_id=edoc_id,
+                        resource_uri=(
+                            f"edoc://{self.resource.config.provider_id}/{edoc_id}"
+                        ),
+                        title=body["title"],
+                        description=body["description"],
+                        enabled=True,
+                        storage=body["storage"],
+                        controllers=tuple(controllers),
+                    )
+                )
+                value = {"document": entry.public_dict(include_enabled=True)}
+                status = 201
             elif path and "/" not in path and method == "PATCH":
                 body = await _read_json(receive)
                 if not body or not set(body).issubset({"title", "description"}):
@@ -475,7 +530,7 @@ class _ProviderApplication:
                 send, 400, {"error": "invalid_request", "detail": str(error)}
             )
             return
-        await _send_json(send, 200, value)
+        await _send_json(send, status, value)
 
 
 def build_provider_server(
@@ -487,7 +542,7 @@ def build_provider_server(
     key_resolver: KeyResolver,
     register_tools: Callable[[MCPServer, ProviderResource], None],
     on_materialized: Callable[
-        [Dataflow, dict[str, Any], tuple[str, ...]], None
+        [Dataflow, dict[str, Any], tuple[str, ...]], Any
     ] | None = None,
 ) -> ProviderApplication:
     resource = ProviderResource(
