@@ -15,16 +15,18 @@ from aauth_edocs import (
     FunctionDescriptor,
     SigningKey,
     VerifiedRequest,
-    build_metadata,
-    build_requirement,
     hash_function_args,
-    issue_resource_token,
     peek_jwt,
 )
 from aauth_edocs.errors import DENIED, INVALID_TOKEN
-from aauth_edocs.headers import AUTH_TOKEN
 from aauth_edocs.httpsig import KeyResolver
-from aauth_edocs.keys import jwk_thumbprint
+from aauth_edocs.resource import (
+    ResourceConfig,
+    mint_resource_token,
+    resource_auth_challenge,
+    resource_jwks_document,
+    token_resource_metadata,
+)
 from mcp.server import MCPServer
 from mcp_aauth import aauth_agent_authentication, aauth_authorization
 from mcp_types import Resource as MCPResource
@@ -210,21 +212,14 @@ class ProviderResource:
         self._check_provider(provider_id)
         if self.catalog.get(edoc_id) is None or self.functions.get(function_id) is None:
             raise AAuthError(DENIED, 403, "eDoc or function is unavailable")
-        agent = verified_agent.claims.get("sub")
-        agent_jwk = (verified_agent.claims.get("cnf") or {}).get("jwk")
-        if not isinstance(agent, str) or not isinstance(agent_jwk, dict):
-            raise AAuthError(INVALID_TOKEN, 401, "agent identity is incomplete")
-        return issue_resource_token(
-            issuer=self.config.resource_issuer,
-            aud=self.config.sentinel_url,
-            agent=agent,
-            agent_jkt=jwk_thumbprint(agent_jwk),
-            scope=function_id,
+        return mint_resource_token(
+            _aauth_resource(self.config),
+            verified_agent,
+            function_id,
             source_agent=self.config.source_agent,
             edoc_id=edoc_id,
             controllers=self._controllers_for(edoc_id),
             function_args=function_args,
-            key=self.config.signing_key,
         )
 
     def execute(
@@ -331,16 +326,9 @@ class _ProviderApplication:
             "/jwks.json",
         }:
             value = (
-                dict(
-                    build_metadata(
-                        self.resource.config.resource_issuer,
-                        jwks_uri=(
-                            f"{self.resource.config.resource_issuer}/jwks.json"
-                        ),
-                    )
-                )
+                token_resource_metadata(self.resource.config.resource_issuer)
                 if path == "/.well-known/aauth-resource.json"
-                else {"keys": [self.resource.config.signing_key.public_jwk]}
+                else resource_jwks_document(self.resource.config.signing_key)
             )
             await _send_json(send, 200, value)
             return
@@ -408,35 +396,21 @@ class _ProviderApplication:
         _receive: Receive,
         send: Send,
     ) -> None:
-        verified_agent = scope["aauth"]
-        agent = verified_agent.claims.get("sub")
-        agent_jwk = (verified_agent.claims.get("cnf") or {}).get("jwk")
-        if not isinstance(agent, str) or not isinstance(agent_jwk, dict):
-            raise AAuthError(INVALID_TOKEN, 401, "agent identity is incomplete")
-        token = issue_resource_token(
-            issuer=self.resource.config.resource_issuer,
-            aud=self.resource.config.sentinel_url,
-            agent=agent,
-            agent_jkt=jwk_thumbprint(agent_jwk),
-            scope="identity@1",
+        body, headers = resource_auth_challenge(
+            _aauth_resource(self.resource.config),
+            scope["aauth"],
+            "identity@1",
             source_agent=self.resource.config.source_agent,
             edoc_id="catalog",
             controllers=self.resource.config.authoritative_controllers,
-            key=self.resource.config.signing_key,
         )
-        body = {
-            "error": INVALID_TOKEN,
-            "error_description": "authorization token required",
-        }
         await _send_json(
             send,
             401,
             body,
             headers=[
-                (
-                    b"aauth-requirement",
-                    build_requirement(AUTH_TOKEN, resource_token=token).encode(),
-                )
+                (name.lower().encode(), value.encode())
+                for name, value in headers.items()
             ],
         )
 
@@ -531,6 +505,15 @@ class _ProviderApplication:
             )
             return
         await _send_json(send, status, value)
+
+
+def _aauth_resource(config: ProviderServerConfig) -> ResourceConfig:
+    """The provider is an AAuth resource whose audience is the Sentinel."""
+    return ResourceConfig(
+        issuer=config.resource_issuer,
+        key=config.signing_key,
+        as_url=config.sentinel_url,
+    )
 
 
 def build_provider_server(
